@@ -9,6 +9,8 @@ import sys
 import windnd
 import traceback
 import locale
+import shutil
+import tempfile
 
 # 글로벌 로그 리스트
 GLOBAL_LOG = []
@@ -72,6 +74,8 @@ class KordocParserApp(ctk.CTk):
         self.configure(fg_color=COLORS["background"])
         
         add_log(f"App initialized. Locale: {locale.getdefaultlocale()}")
+        self.tmp_dir = tempfile.mkdtemp(prefix="kordoc_")
+        add_log(f"Session Temp Dir: {self.tmp_dir}")
         self.is_running = False
         self.tasks = []
         self.setup_ui()
@@ -109,22 +113,32 @@ class KordocParserApp(ctk.CTk):
         self.task_list_frame = ctk.CTkFrame(self.main_content, fg_color="transparent")
         self.task_list_frame.pack(fill="x")
 
-        self.footer = ctk.CTkFrame(self, fg_color=COLORS["white"], corner_radius=25, height=200)
+        self.footer = ctk.CTkFrame(self, fg_color=COLORS["white"], corner_radius=25, height=120)
         self.footer.pack(fill="x", side="bottom", padx=10, pady=10)
+        
         self.action_btn_frame = ctk.CTkFrame(self.footer, fg_color="transparent")
-        self.action_btn_frame.pack(fill="x", padx=20, pady=(20, 10))
-        self.stop_btn = ctk.CTkButton(self.action_btn_frame, text="🛑 중단", font=(FONT_MAIN, 14, "bold"),
+        self.action_btn_frame.pack(fill="x", padx=10, pady=20)
+        
+        button_font = (FONT_MAIN, 13, "bold")
+        self.stop_btn = ctk.CTkButton(self.action_btn_frame, text="🛑 중단", font=button_font,
                                      fg_color="#FEE2E2", text_color=COLORS["error"], hover_color="#FECACA",
-                                     height=50, corner_radius=25, command=self.stop_all)
-        self.stop_btn.pack(side="left", expand=True, padx=(0, 5))
-        self.reset_btn = ctk.CTkButton(self.action_btn_frame, text="🔄 초기화", font=(FONT_MAIN, 14, "bold"),
+                                     height=45, corner_radius=20, width=120, command=self.stop_all)
+        self.stop_btn.pack(side="left", expand=True, padx=5)
+        
+        self.reset_btn = ctk.CTkButton(self.action_btn_frame, text="🔄 초기화", font=button_font,
                                       fg_color=COLORS["surface_container"], text_color=COLORS["on_surface"],
-                                      hover_color=COLORS["primary_container"], height=50, corner_radius=25, command=self.reset_ui)
-        self.reset_btn.pack(side="left", expand=True, padx=(5, 0))
-        self.save_btn = ctk.CTkButton(self.footer, text="☁️ 변환 완료 확인", font=(FONT_MAIN, 16, "bold"),
+                                      hover_color=COLORS["primary_container"], height=45, corner_radius=20, width=120, command=self.reset_ui)
+        self.reset_btn.pack(side="left", expand=True, padx=5)
+
+        self.save_btn = ctk.CTkButton(self.action_btn_frame, text="💾 결과 저장", font=button_font,
                                      fg_color=COLORS["secondary"], text_color=COLORS["white"],
-                                     hover_color="#2d4b3a", height=60, corner_radius=30, command=self.on_save_button)
-        self.save_btn.pack(fill="x", padx=20, pady=(10, 20))
+                                     hover_color="#2d4b3a", height=45, corner_radius=20, width=120, command=self.on_save_button)
+        self.save_btn.pack(side="left", expand=True, padx=5)
+
+        self.open_dir_btn = ctk.CTkButton(self.footer, text="🔍 작업 폴더 열기", font=(FONT_MAIN, 10),
+                                         fg_color="transparent", text_color=COLORS["secondary"],
+                                         height=20, command=self.open_result_folder)
+        self.open_dir_btn.place(relx=0.5, rely=0.9, anchor="center")
 
     def get_engine_command(self):
         if getattr(sys, 'frozen', False):
@@ -178,7 +192,8 @@ class KordocParserApp(ctk.CTk):
                     self.after(0, lambda i=item: i.update_progress(0, "오류: 파일 없음"))
                     continue
 
-                cmd = engine_base + [fp, "-o", fp + ".md"]
+                md_path = os.path.join(self.tmp_dir, os.path.basename(fp) + ".md")
+                cmd = engine_base + [fp, "-o", md_path]
                 si = subprocess.STARTUPINFO()
                 si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                 process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
@@ -217,7 +232,49 @@ class KordocParserApp(ctk.CTk):
         add_log("UI Reset.")
 
     def on_save_button(self):
-        messagebox.showinfo("Kordoc Parser", "모든 완료된 파일이 원본 폴더에 저장되었습니다!")
+        if not self.tasks:
+            messagebox.showwarning("Kordoc Parser", "아직 변환된 파일이 없습니다.")
+            return
+            
+        dest_dir = filedialog.askdirectory(title="결과물을 저장할 폴더를 선택하세요")
+        if not dest_dir:
+            return
+            
+        success_count = 0
+        error_count = 0
+        for fp, item in self.tasks:
+            md_filename = os.path.basename(fp) + ".md"
+            md_path = os.path.join(self.tmp_dir, md_filename)
+            if os.path.exists(md_path):
+                dest_path = os.path.join(dest_dir, md_filename)
+                if os.path.exists(dest_path):
+                    if not messagebox.askyesno("중복 파일", f"'{md_filename}' 파일이 이미 존재합니다. 덮어쓸까요?"):
+                        continue
+                try:
+                    shutil.copy2(md_path, dest_path)
+                    success_count += 1
+                except Exception as e:
+                    add_log(f"Copy Error: {str(e)}")
+                    error_count += 1
+            else:
+                error_count += 1
+                
+        if error_count == 0:
+            messagebox.showinfo("저장 완료", f"{success_count}개의 파일을 성공적으로 저장했습니다!")
+        else:
+            messagebox.showinfo("저장 완료", f"{success_count}개 저장 성공, {error_count}개 실패(또는 아직 변환 중)")
+
+    def open_result_folder(self):
+        if self.tasks:
+            # 마지막 파일의 폴더 열기
+            path = os.path.dirname(self.tasks[-1][0])
+        else:
+            path = os.getcwd()
+            
+        if os.path.exists(path):
+            os.startfile(path)
+        else:
+            messagebox.showerror("오류", "폴더를 찾을 수 없습니다.")
 
 if __name__ == "__main__":
     ctk.set_appearance_mode("light")

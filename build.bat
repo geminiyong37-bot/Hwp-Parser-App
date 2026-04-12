@@ -6,10 +6,8 @@ if exist build rd /s /q build
 if exist dist rd /s /q dist
 
 :: PyInstaller 실행
-:: --onefile: 단일 실행 파일로 단일화
-:: --noconsole: 실행 시 터미널 창(CMD)이 뜨지 않게 함
-:: --add-binary: kordoc.exe를 포함시킴 (세미콜론 ; 뒤는 내부 경로)
-pyinstaller --onefile --noconsole --add-binary "C:\Antigravity\kordoc\kordoc.exe;." --name "Kordoc-Parser" main.py
+:: .spec 파일을 직접 사용하여 빌드 (설정값들이 이미 spec 파일에 정의되어 있음)
+pyinstaller Kordoc-Parser.spec
 
 echo.
 if %ERRORLEVEL% EQU 0 (

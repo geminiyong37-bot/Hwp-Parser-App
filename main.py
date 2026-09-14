@@ -11,13 +11,21 @@ import traceback
 import locale
 import shutil
 import tempfile
+import queue
+import time
 
 # 글로벌 로그 리스트
 GLOBAL_LOG = []
 
 def add_log(msg):
     GLOBAL_LOG.append(msg)
-    print(msg)
+    if sys.stdout is not None:
+        print(msg)
+
+def get_output_filename(file_path):
+    filename = os.path.basename(file_path)
+    name_without_extension, _ = os.path.splitext(filename)
+    return name_without_extension + ".md"
 
 def handle_exception(exc_type, exc_value, exc_traceback):
     if issubclass(exc_type, KeyboardInterrupt):
@@ -78,8 +86,17 @@ class KordocParserApp(ctk.CTk):
         add_log(f"Session Temp Dir: {self.tmp_dir}")
         self.is_running = False
         self.tasks = []
+        self.ui_queue = queue.Queue()
+        self.run_id = 0
+        self.stop_event = None
+        self.worker_thread = None
+        self.current_process = None
+        self.process_lock = threading.Lock()
+        self.closing = False
         self.setup_ui()
         windnd.hook_dropfiles(self, func=self.on_drop_files)
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.after(50, self.process_ui_queue)
 
     def setup_ui(self):
         self.header = ctk.CTkFrame(self, fg_color=COLORS["background"], corner_radius=0, height=100)
@@ -144,11 +161,11 @@ class KordocParserApp(ctk.CTk):
         if getattr(sys, 'frozen', False):
             base = sys._MEIPASS
             node_exe = os.path.join(base, "engine", "node.exe")
-            cli_js = os.path.join(base, "engine", "kordoc", "dist", "cli.cjs")
+            cli_js = os.path.join(base, "engine", "kordoc", "dist", "cli.js")
             add_log(f"Engine target (Frozen): {node_exe}")
             return [node_exe, cli_js]
         else:
-            return ["node", r"C:\Antigravity\kordoc\dist\cli.cjs"]
+            return ["node", r"C:\Antigravity\kordoc\dist\cli.js"]
 
     def decode_path(self, f):
         if not isinstance(f, bytes): return str(f)
@@ -172,45 +189,102 @@ class KordocParserApp(ctk.CTk):
             self.start_parsing(list(file_paths))
 
     def start_parsing(self, file_paths):
+        if self.is_running or (self.worker_thread and self.worker_thread.is_alive()):
+            messagebox.showwarning("Kordoc Parser", "현재 변환 작업이 끝난 뒤 다시 시도해주세요.")
+            return
+
         self.is_running = True
         self.task_chip.configure(text=f"{len(file_paths)}개 작업")
+        new_tasks = []
         for fp in file_paths:
             item = FileTaskItem(self.task_list_frame, os.path.basename(fp))
             item.pack(fill="x", pady=10)
             self.tasks.append((fp, item))
-        threading.Thread(target=self.process_queue, daemon=True).start()
+            new_tasks.append((fp, item))
 
-    def process_queue(self):
+        self.run_id += 1
+        current_run_id = self.run_id
+        self.stop_event = threading.Event()
+        self.worker_thread = threading.Thread(
+            target=self.process_queue,
+            args=(new_tasks, current_run_id, self.stop_event),
+            daemon=True,
+        )
+        self.worker_thread.start()
+
+    def queue_item_update(self, run_id, item, method_name, *args):
+        self.ui_queue.put(("item", run_id, item, method_name, args))
+
+    def process_ui_queue(self):
+        try:
+            while True:
+                event = self.ui_queue.get_nowait()
+                event_type, event_run_id = event[:2]
+                if event_run_id != self.run_id:
+                    continue
+
+                if event_type == "item":
+                    _, _, item, method_name, args = event
+                    if item.winfo_exists():
+                        getattr(item, method_name)(*args)
+                elif event_type == "finished":
+                    self.is_running = False
+                    self.stop_event = None
+        except queue.Empty:
+            pass
+        except Exception as e:
+            add_log(f"UI UPDATE ERROR: {str(e)}")
+
+        if not self.closing:
+            self.after(50, self.process_ui_queue)
+
+    def process_queue(self, tasks, run_id, stop_event):
         engine_base = self.get_engine_command()
-        for fp, item in self.tasks:
-            if not self.is_running: break
-            self.after(0, lambda i=item: i.update_progress(0.1, "파싱 중..."))
+        for fp, item in tasks:
+            if stop_event.is_set():
+                break
+            self.queue_item_update(run_id, item, "update_progress", 0.1, "파싱 중...")
             add_log(f"Processing: {fp}")
             try:
                 if not os.path.exists(fp):
                     add_log(f"ERROR: File not found: {fp}")
-                    self.after(0, lambda i=item: i.update_progress(0, "오류: 파일 없음"))
+                    self.queue_item_update(run_id, item, "update_progress", 0, "오류: 파일 없음")
                     continue
 
-                md_path = os.path.join(self.tmp_dir, os.path.basename(fp) + ".md")
+                md_path = os.path.join(self.tmp_dir, get_output_filename(fp))
                 cmd = engine_base + [fp, "-o", md_path]
                 si = subprocess.STARTUPINFO()
                 si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                if stop_event.is_set():
+                    break
                 process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
                                           startupinfo=si, cwd=os.path.dirname(engine_base[0]))
-                stdout, stderr = process.communicate()
+                with self.process_lock:
+                    self.current_process = process
+                if stop_event.is_set() and process.poll() is None:
+                    process.terminate()
+                try:
+                    stdout, stderr = process.communicate()
+                finally:
+                    with self.process_lock:
+                        if self.current_process is process:
+                            self.current_process = None
+
+                if stop_event.is_set():
+                    break
                 
                 if process.returncode == 0:
                     add_log(f"SUCCESS: {fp}")
-                    self.after(0, lambda i=item: i.mark_complete())
+                    self.queue_item_update(run_id, item, "mark_complete")
                 else:
                     err_text = stderr.decode('utf-8', errors='ignore') or stderr.decode('cp949', errors='ignore')
                     add_log(f"FAILED: {fp}\nReturn code: {process.returncode}\nStderr: {err_text}")
-                    self.after(0, lambda i=item: i.update_progress(0, f"실패: {err_text[:40]}"))
+                    self.queue_item_update(run_id, item, "update_progress", 0, f"실패: {err_text[:40]}")
             except Exception as e:
                 add_log(f"EXCEPTION: {str(e)}")
-                self.after(0, lambda i=item: i.update_progress(0, f"오류: {str(e)[:20]}"))
-        self.is_running = False
+                if not stop_event.is_set():
+                    self.queue_item_update(run_id, item, "update_progress", 0, f"오류: {str(e)[:20]}")
+        self.ui_queue.put(("finished", run_id))
 
     def save_log(self):
         log_path = os.path.join(os.path.expanduser("~"), "Desktop", "kordoc_debug_log.txt")
@@ -219,12 +293,12 @@ class KordocParserApp(ctk.CTk):
         messagebox.showinfo("로그 저장", f"바탕화면에 'kordoc_debug_log.txt'가 저장되었습니다.\n내용을 메인 챗방에 공유해주세요!")
 
     def stop_all(self):
-        self.is_running = False
+        self.cancel_current_run()
         add_log("User stopped task.")
         messagebox.showinfo("정지", "작업이 중지되었습니다.")
 
     def reset_ui(self):
-        self.is_running = False
+        self.cancel_current_run()
         for child in self.task_list_frame.winfo_children():
             child.destroy()
         self.tasks = []
@@ -243,7 +317,7 @@ class KordocParserApp(ctk.CTk):
         success_count = 0
         error_count = 0
         for fp, item in self.tasks:
-            md_filename = os.path.basename(fp) + ".md"
+            md_filename = get_output_filename(fp)
             md_path = os.path.join(self.tmp_dir, md_filename)
             if os.path.exists(md_path):
                 dest_path = os.path.join(dest_dir, md_filename)
@@ -275,6 +349,45 @@ class KordocParserApp(ctk.CTk):
             os.startfile(path)
         else:
             messagebox.showerror("오류", "폴더를 찾을 수 없습니다.")
+
+    def cancel_current_run(self):
+        self.is_running = False
+        self.run_id += 1
+        if self.stop_event is not None:
+            self.stop_event.set()
+
+        with self.process_lock:
+            process = self.current_process
+        if process is not None and process.poll() is None:
+            try:
+                process.terminate()
+            except Exception as e:
+                add_log(f"PROCESS TERMINATE ERROR: {str(e)}")
+
+    def on_close(self):
+        if self.closing:
+            return
+        self.closing = True
+        self.cancel_current_run()
+        self.close_deadline = time.monotonic() + 3
+        self.wait_for_worker_and_close()
+
+    def wait_for_worker_and_close(self):
+        if self.worker_thread and self.worker_thread.is_alive() and time.monotonic() < self.close_deadline:
+            self.after(50, self.wait_for_worker_and_close)
+            return
+
+        if self.worker_thread and self.worker_thread.is_alive():
+            with self.process_lock:
+                process = self.current_process
+            if process is not None and process.poll() is None:
+                try:
+                    process.kill()
+                except Exception as e:
+                    add_log(f"PROCESS KILL ERROR: {str(e)}")
+
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+        self.destroy()
 
 if __name__ == "__main__":
     ctk.set_appearance_mode("light")

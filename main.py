@@ -160,12 +160,15 @@ class KordocParserApp(ctk.CTk):
     def get_engine_command(self):
         if getattr(sys, 'frozen', False):
             base = sys._MEIPASS
-            node_exe = os.path.join(base, "engine", "node.exe")
-            cli_js = os.path.join(base, "engine", "kordoc", "dist", "cli.js")
-            add_log(f"Engine target (Frozen): {node_exe}")
-            return [node_exe, cli_js]
+            mode = "Frozen"
         else:
-            return ["node", r"C:\Antigravity\kordoc\dist\cli.js"]
+            base = os.path.dirname(os.path.realpath(__file__))
+            mode = "Development"
+
+        node_exe = os.path.join(base, "engine", "node.exe")
+        cli_js = os.path.join(base, "engine", "kordoc", "dist", "cli.js")
+        add_log(f"Engine target ({mode}): {node_exe}")
+        return [node_exe, cli_js]
 
     def decode_path(self, f):
         if not isinstance(f, bytes): return str(f)
